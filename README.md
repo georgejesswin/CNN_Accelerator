@@ -1,42 +1,355 @@
-# CNN Accelerator Documentation
-
-## Introduction to CNN Accelerator
-The CNN Accelerator is designed to enhance the performance and efficiency of Convolutional Neural Networks (CNNs) on FPGA platforms, specifically targeting real-time applications in mobile and embedded systems.
-
+# CNN Accelerator
 ## FPGA-Based Depthwise Separable Convolution Engine for MobileNetSSD
-This engine utilizes a depthwise separable convolution approach to significantly reduce the number of computations and parameters, making it suitable for MobileNetSSD architecture, which is optimized for speed and efficiency.
 
-## Architecture Overview
-The architecture consists of:
-- **Input Layer**: Preprocessing input images.
-- **Depthwise Convolution Layer**: Applies a single filter to each input channel.
-- **Pointwise Convolution Layer**: Combines the outputs of the depthwise layer to achieve higher dimensional complexity.
-- **Output Layer**: Produces the final predictions.
+### 📌 Overview
 
-## Project Structure
-The project is organized as follows:
+This project implements a hardware accelerator for Convolutional Neural Networks (CNNs) in Verilog, specifically optimized for MobileNet-style depthwise separable convolutions.
+
+The design targets FPGA deployment and accelerates the fundamental building block of MobileNetSSD:
+
 ```
-CNN_Accelerator/
-├── src/                    # Source code for the engine
-├── include/                # Header files
-├── tests/                  # Unit tests and validation
-└── README.md               # Project documentation
+Depthwise Convolution (3×3)
+        +
+Pointwise Convolution (1×1)
 ```
 
-## Performance Characteristics
-- **Throughput**: Achieves high throughput rates, making it suitable for real-time applications.
-- **Latency**: Low latency due to the optimized architecture and implementation.
-- **Resource Utilization**: Efficient use of FPGA resources, minimizing overhead.
+The architecture is fully streaming, AXI-Stream compliant, and optimized for FPGA resource efficiency using:
 
-## Memory Architecture
-The memory architecture is designed to optimize data flow and minimize bottlenecks:
-- **On-Chip Memory**: For storing temporary data and weights.
-- **Off-Chip Memory**: For larger datasets and model weights.
+- Parallel MAC arrays
+- Tiled computation
+- BRAM-based weight blocking
+- Pipelined arithmetic
+- Backpressure-safe streaming
 
-## Design Philosophy
-The design philosophy emphasizes:
-- **Efficiency**: Balancing performance with resource consumption.
-- **Modularity**: Allowing easy updates and modifications to the architecture.
-- **Scalability**: Ensuring that the design can accommodate larger models and datasets as needed.
+### 🏗 Architecture Overview
 
-This comprehensive documentation serves as a guide for understanding the design and implementation of the CNN Accelerator and can be expanded upon as the project evolves.
+#### 🔹 Depthwise Separable Convolution Block
+
+Each block implements:
+
+```
+Input Feature Map
+        ↓
+Depthwise 3×3 Convolution (per channel)
+        ↓
+Pointwise 1×1 Convolution (channel mixing)
+        ↓
+Output Feature Map
+```
+
+This matches the MobileNet architecture used in MobileNetSSD.
+
+#### 🔬 High-Level Hardware Architecture
+
+```
+            AXI-Stream Input
+                    │
+                    ▼
+           depthwise_layer_stream
+                    │
+                    ▼
+           pointwise_layer_stream
+                    │
+                    ▼
+            AXI-Stream Output
+```
+
+The top-level module:
+
+`conv_dw_pw_top.v`
+
+connects depthwise and pointwise layers directly via AXI backpressure.
+
+### 📦 Project Structure
+
+#### 🟢 1. Depthwise Convolution Subsystem
+
+**depthwise_layer_stream.v**
+
+Implements streaming 3×3 depthwise convolution:
+
+- One convolution per input channel
+- Fully streaming architecture
+- AXI-Stream slave + master
+- Backpressure-aware
+
+##### Key Internal Modules
+
+| Module | Purpose |
+|--------|---------|
+| image_control.v | 3×3 sliding window generator using line buffers |
+| kernel_regs_multi.v | Per-channel kernel storage |
+| depthwise_conv3x3.v | MAC datapath |
+| depthwise_mac.v | Pipelined multiply-accumulate |
+
+##### Depthwise Characteristics
+
+- Produces 1 spatial pixel per cycle (after warm-up)
+- Parallel across channels
+- Fully pipelined
+- Zero internal spatial blocking
+
+#### 🔵 2. Pointwise Convolution Subsystem (1×1 Conv)
+
+**pointwise_layer_stream.v**
+
+Implements channel mixing via tiled 1×1 convolution.
+
+Unlike depthwise, this layer is tiled across channels.
+
+##### 🔹 Parallelism Configuration
+
+```
+PAR_CIN  = 8
+PAR_COUT = 8
+```
+
+This means:
+
+- 8 input channels processed per cycle
+- 8 output channels computed in parallel
+- 64 DSP multipliers used (8×8)
+
+##### 🔹 Tiling Strategy
+
+Given:
+
+```
+CIN  = 32
+COUT = 64
+```
+
+The engine performs:
+
+```
+NUM_CIN_ITER  = CIN / PAR_CIN  = 4
+NUM_COUT_ITER = COUT / PAR_COUT = 8
+```
+
+Per spatial pixel:
+
+8 output blocks × 4 input blocks
+
+Accumulation happens over multiple cycles.
+
+##### Key Internal Modules
+
+| Module | Purpose |
+|--------|---------|
+| pointwise_conv1x1_fsm_axis.v | Tiling controller FSM |
+| pointwise_weight_regs.v | BRAM-based block weight storage |
+| pointwise_mac_datapath.v | Fully pipelined MAC tree |
+
+##### 🔹 Pointwise MAC Architecture
+
+Each cycle performs:
+
+```
+8 output channels × 8 input channels
+= 64 multiplications
+```
+
+The datapath contains:
+
+- DSP-mapped multipliers
+- Pipelined adder tree
+- Accumulator registers
+- Latency-aligned control
+
+Latency:
+
+```
+MAC_LATENCY = 2 + log2(PAR_CIN)
+```
+
+### 🧠 Dataflow Model
+
+#### Depthwise Layer
+
+- Streaming spatial pipeline
+- No spatial blocking
+- Output: full CIN channel vector per pixel
+
+#### Pointwise Layer
+
+- Spatially blocking per pixel
+- Channel-tiled accumulation
+- Output generated after full CIN accumulation
+
+### ⚙️ Top-Level Integration
+
+**conv_dw_pw_top.v**
+
+Implements:
+
+- AXI slave input
+- Depthwise layer
+- Direct AXI chaining to pointwise
+- AXI master output
+- Independent weight loading interfaces
+
+No FIFOs are used in the final version — backpressure is fully AXI-driven.
+
+### 📊 Performance Characteristics
+
+#### Depthwise
+
+- Throughput: 1 pixel / cycle
+- Highly efficient
+- Fully pipelined
+
+#### Pointwise (8×8 Tiled)
+
+For:
+
+```
+CIN  = 32
+COUT = 64
+```
+
+Per pixel cycles:
+
+```
+NUM_COUT_ITER × (NUM_CIN_ITER + MAC_LATENCY)
+≈ 8 × (4 + 5)
+≈ 72 cycles per pixel
+```
+
+Thus overall throughput is limited by pointwise tiling.
+
+### 💾 Memory Architecture
+
+#### Depthwise
+
+- Distributed RAM for small kernels
+- Line buffers using BRAM
+- Per-channel kernel storage
+
+#### Pointwise
+
+- BRAM-based tiled weight storage
+- Block-organized memory layout
+- No full-memory reset
+- Linear-to-tile address remapping
+
+### 🔁 AXI Streaming Behavior
+
+All layers use:
+
+- s_axis_tvalid
+- s_axis_tready
+- m_axis_tvalid
+- m_axis_tready
+
+Backpressure propagates naturally:
+
+```
+Output stall
+    ↓
+Pointwise stall
+    ↓
+Depthwise stall
+    ↓
+Input stall
+```
+
+No data loss.
+Fully AXI-compliant.
+
+### 🎯 Design Goals
+
+- Efficient FPGA implementation
+- Modular separable convolution block
+- Parameterizable CIN / COUT
+- Reusable MAC datapath
+- Clean tiling logic
+- Backpressure-safe streaming
+
+### 🛠 Target Platform
+
+- Verilog HDL
+- FPGA (e.g., Xilinx Zynq, ZedBoard)
+- Designed for Vivado synthesis
+- DSP-mapped multipliers
+- BRAM-backed weight storage
+
+### 🚀 How to Use
+
+#### 1️⃣ Load Weights
+
+Load depthwise kernels via `dw_kernel_wr_*`
+
+Load pointwise weights via `pw_wr_*`
+
+#### 2️⃣ Stream Input Feature Maps
+
+Provide:
+
+`[CIN × DATA_W]` per cycle
+
+over AXI-Stream interface.
+
+#### 3️⃣ Receive Output
+
+Output:
+
+`[COUT × DATA_W]`
+
+per completed pixel.
+
+Interrupt signals indicate block completion.
+
+### 📐 Design Philosophy
+
+This accelerator emphasizes:
+
+- Hardware realism
+- Explicit tiling control
+- Deterministic latency
+- Clean modular boundaries
+- FPGA-friendly arithmetic
+
+The architecture reflects real-world constraints:
+
+- Limited DSP count
+- Limited BRAM
+- Controlled parallelism
+- Balanced resource usage
+
+### ⚠ Known Architectural Limitation
+
+The current pointwise layer uses spatial blocking per pixel.
+
+This limits throughput to:
+
+~1 pixel per 72 cycles (for 32×64 case)
+
+Future optimization would require:
+
+- Spatial streaming accumulation
+- Systolic pointwise engine
+- Cross-pixel overlap
+
+### 📚 Model Support
+
+The hardware is designed for:
+
+- MobileNetSSD
+- Caffe-based .prototxt and .caffemodel
+- Depthwise separable convolution networks
+
+### 🏁 Summary
+
+This project implements:
+
+- A full separable convolution accelerator
+- FPGA-optimized tiled pointwise engine
+- Streaming depthwise convolution
+- AXI-compliant modular design
+- Hardware-aware CNN execution
+
+It serves as a strong foundation for:
+
+- Edge AI acceleration
+- FPGA CNN research
+- MobileNet-style hardware inference
