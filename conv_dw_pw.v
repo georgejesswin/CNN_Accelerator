@@ -5,10 +5,10 @@
 module conv_dw_pw_top #(
     parameter DATA_W    = 8,
     parameter IMG_WIDTH = 224,
-    parameter CIN       = 128,
-    parameter COUT      = 256,
-    parameter PAR_CIN       = 8,
-    parameter PAR_COUT       = 8
+    parameter CIN       = 32,
+    parameter COUT      = 64,
+    parameter PAR_CIN       = 16,
+    parameter PAR_COUT       = 16
 )(
     input  wire                  clk,
     input  wire                  reset,   // ACTIVE HIGH
