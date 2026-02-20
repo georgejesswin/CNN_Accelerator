@@ -1,0 +1,159 @@
+module pointwise_mac_datapath #(
+    parameter DATA_W   = 8,
+    parameter ACC_W    = 64,
+    parameter PAR_CIN  = 8,   // MUST be power of 2
+    parameter PAR_COUT = 8
+)(
+    input  wire                               clk,
+    input  wire                               reset,
+    input  wire                               acc_clear,
+    input  wire                               acc_enable,
+    input  wire signed [PAR_CIN*DATA_W-1:0]   feature_vec,
+    input  wire signed [PAR_COUT*PAR_CIN*DATA_W-1:0] weight_vec,
+    output wire signed [PAR_COUT*ACC_W-1:0]   acc_out
+);
+
+    // =========================================================
+    // Compile-time Power-of-2 Check
+    // =========================================================
+    initial begin
+        if (PAR_CIN & (PAR_CIN - 1))
+            $error("PAR_CIN must be power of 2.");
+    end
+
+    // =========================================================
+    // Parameters
+    // =========================================================
+    localparam PROD_W   = 2 * DATA_W;
+    localparam TREE_LVL = $clog2(PAR_CIN);
+    localparam SUM_W    = PROD_W + TREE_LVL;
+    localparam LATENCY  = 2 + TREE_LVL;  
+    // 1 input reg + 1 mult + TREE_LVL tree stages
+
+    integer g, i;
+
+    // =========================================================
+    // Stage 0: Input Register
+    // =========================================================
+    reg signed [PAR_CIN*DATA_W-1:0]            feature_vec_r;
+    reg signed [PAR_COUT*PAR_CIN*DATA_W-1:0]   weight_vec_r;
+
+    always @(posedge clk) begin
+        feature_vec_r <= feature_vec;
+        weight_vec_r  <= weight_vec;
+    end
+
+    // =========================================================
+    // Stage 1: Multiply
+    // =========================================================
+    (* use_dsp = "yes" *)
+    reg signed [PROD_W-1:0] mult [0:PAR_COUT-1][0:PAR_CIN-1];
+
+    always @(posedge clk) begin
+        for (g = 0; g < PAR_COUT; g = g + 1) begin
+            for (i = 0; i < PAR_CIN; i = i + 1) begin
+                mult[g][i] <=
+                    $signed(feature_vec_r[i*DATA_W +: DATA_W]) *
+                    $signed(weight_vec_r[(g*PAR_CIN+i)*DATA_W +: DATA_W]);
+            end
+        end
+    end
+
+    // =========================================================
+    // Stage 2: Tree Level 0 (sign extend + first add)
+    // =========================================================
+    reg signed [SUM_W-1:0] tree_lvl 
+        [0:PAR_COUT-1][0:TREE_LVL-1][0:PAR_CIN/2-1];
+
+    always @(posedge clk) begin
+        for (g = 0; g < PAR_COUT; g = g + 1) begin
+            for (i = 0; i < PAR_CIN/2; i = i + 1) begin
+                tree_lvl[g][0][i] <=
+                    {{(SUM_W-PROD_W){mult[g][2*i][PROD_W-1]}}, mult[g][2*i]} +
+                    {{(SUM_W-PROD_W){mult[g][2*i+1][PROD_W-1]}}, mult[g][2*i+1]};
+            end
+        end
+    end
+
+    // =========================================================
+    // Remaining Tree Levels (Fully Pipelined)
+    // =========================================================
+    genvar lvl;
+    generate
+        for (lvl = 1; lvl < TREE_LVL; lvl = lvl + 1) begin : TREE_GEN
+            integer idx;
+            always @(posedge clk) begin
+                for (g = 0; g < PAR_COUT; g = g + 1) begin
+                    for (idx = 0; idx < (PAR_CIN >> (lvl+1)); idx = idx + 1) begin
+                        tree_lvl[g][lvl][idx] <=
+                            tree_lvl[g][lvl-1][2*idx] +
+                            tree_lvl[g][lvl-1][2*idx+1];
+                    end
+                end
+            end
+        end
+    endgenerate
+
+    // =========================================================
+    // Final Reduced Sum
+    // =========================================================
+    wire signed [SUM_W-1:0] cycle_sum [0:PAR_COUT-1];
+
+    genvar gi;
+    generate
+        for (gi = 0; gi < PAR_COUT; gi = gi + 1) begin : SUM_OUT
+            assign cycle_sum[gi] = tree_lvl[gi][TREE_LVL-1][0];
+        end
+    endgenerate
+
+    // =========================================================
+    // Align Control Signals
+    // =========================================================
+    reg [LATENCY-1:0] acc_enable_pipe;
+    reg [LATENCY-1:0] acc_clear_pipe;
+
+    always @(posedge clk) begin
+        if (reset) begin
+            acc_enable_pipe <= 0;
+            acc_clear_pipe  <= 0;
+        end
+        else begin
+            acc_enable_pipe <= {acc_enable_pipe[LATENCY-2:0], acc_enable};
+            acc_clear_pipe  <= {acc_clear_pipe[LATENCY-2:0],  acc_clear};
+        end
+    end
+
+    wire acc_enable_aligned = acc_enable_pipe[LATENCY-1];
+    wire acc_clear_aligned  = acc_clear_pipe[LATENCY-1];
+
+    // =========================================================
+    // Accumulator
+    // =========================================================
+    (* use_dsp = "yes" *)
+    reg signed [ACC_W-1:0] acc_reg [0:PAR_COUT-1];
+
+    always @(posedge clk) begin
+        if (reset) begin
+            for (g = 0; g < PAR_COUT; g = g + 1)
+                acc_reg[g] <= 0;
+        end
+        else if (acc_clear_aligned) begin
+            for (g = 0; g < PAR_COUT; g = g + 1)
+                acc_reg[g] <= 0;
+        end
+        else if (acc_enable_aligned) begin
+            for (g = 0; g < PAR_COUT; g = g + 1)
+                acc_reg[g] <= acc_reg[g] + cycle_sum[g];
+        end
+    end
+
+    // =========================================================
+    // Output Packing
+    // =========================================================
+    generate
+        for (gi = 0; gi < PAR_COUT; gi = gi + 1) begin : OUT_PACK
+            assign acc_out[gi*ACC_W +: ACC_W] = acc_reg[gi];
+        end
+    endgenerate
+
+endmodule
