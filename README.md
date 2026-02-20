@@ -64,7 +64,7 @@ connects depthwise and pointwise layers directly via AXI backpressure.
 
 #### 🟢 1. Depthwise Convolution Subsystem
 
-**depthwise_layer_stream.v**
+**depthwise_conv.v**
 
 Implements streaming 3×3 depthwise convolution:
 
@@ -77,10 +77,9 @@ Implements streaming 3×3 depthwise convolution:
 
 | Module | Purpose |
 |--------|---------|
-| image_control.v | 3×3 sliding window generator using line buffers |
-| kernel_regs_multi.v | Per-channel kernel storage |
-| depthwise_conv3x3.v | MAC datapath |
-| depthwise_mac.v | Pipelined multiply-accumulate |
+| depthwise_image_control.v | 3×3 sliding window generator using line buffers |
+| depthwise_kernel.v | Per-channel kernel storage |
+| depthwise_mac.v | MAC datapath |
 
 ##### Depthwise Characteristics
 
@@ -100,15 +99,14 @@ Unlike depthwise, this layer is tiled across channels.
 ##### 🔹 Parallelism Configuration
 
 ```
-PAR_CIN  = 8
-PAR_COUT = 8
+PAR_CIN  = 16
+PAR_COUT = 16
 ```
 
 This means:
 
-- 8 input channels processed per cycle
-- 8 output channels computed in parallel
-- 64 DSP multipliers used (8×8)
+- 16 input channels processed per cycle
+- 16 output channels computed in parallel
 
 ##### 🔹 Tiling Strategy
 
@@ -122,13 +120,13 @@ COUT = 64
 The engine performs:
 
 ```
-NUM_CIN_ITER  = CIN / PAR_CIN  = 4
-NUM_COUT_ITER = COUT / PAR_COUT = 8
+NUM_CIN_ITER  = CIN / PAR_CIN  = 2
+NUM_COUT_ITER = COUT / PAR_COUT = 4
 ```
 
 Per spatial pixel:
 
-8 output blocks × 4 input blocks
+4 output blocks × 2 input blocks
 
 Accumulation happens over multiple cycles.
 
@@ -145,8 +143,8 @@ Accumulation happens over multiple cycles.
 Each cycle performs:
 
 ```
-8 output channels × 8 input channels
-= 64 multiplications
+16 output channels × 16 input channels
+= 256 multiplications
 ```
 
 The datapath contains:
@@ -211,8 +209,8 @@ Per pixel cycles:
 
 ```
 NUM_COUT_ITER × (NUM_CIN_ITER + MAC_LATENCY)
-≈ 8 × (4 + 5)
-≈ 72 cycles per pixel
+≈ 4 × (2 + 6)
+≈ 32 cycles per pixel
 ```
 
 Thus overall throughput is limited by pointwise tiling.
@@ -265,40 +263,6 @@ Fully AXI-compliant.
 - Clean tiling logic
 - Backpressure-safe streaming
 
-### 🛠 Target Platform
-
-- Verilog HDL
-- FPGA (e.g., Xilinx Zynq, ZedBoard)
-- Designed for Vivado synthesis
-- DSP-mapped multipliers
-- BRAM-backed weight storage
-
-### 🚀 How to Use
-
-#### 1️⃣ Load Weights
-
-Load depthwise kernels via `dw_kernel_wr_*`
-
-Load pointwise weights via `pw_wr_*`
-
-#### 2️⃣ Stream Input Feature Maps
-
-Provide:
-
-`[CIN × DATA_W]` per cycle
-
-over AXI-Stream interface.
-
-#### 3️⃣ Receive Output
-
-Output:
-
-`[COUT × DATA_W]`
-
-per completed pixel.
-
-Interrupt signals indicate block completion.
-
 ### 📐 Design Philosophy
 
 This accelerator emphasizes:
@@ -322,7 +286,7 @@ The current pointwise layer uses spatial blocking per pixel.
 
 This limits throughput to:
 
-~1 pixel per 72 cycles (for 32×64 case)
+~1 pixel per 32 cycles (for 32×64 case)
 
 Future optimization would require:
 
@@ -348,8 +312,4 @@ This project implements:
 - AXI-compliant modular design
 - Hardware-aware CNN execution
 
-It serves as a strong foundation for:
 
-- Edge AI acceleration
-- FPGA CNN research
-- MobileNet-style hardware inference
